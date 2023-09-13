@@ -1,34 +1,67 @@
-name: ci
+name: Docker Pipeline
+on:
+    push:
+        branches:
+            - "**"
 
-on: [ push, pull_request ]
+env:
+    GITHUB_REGISTRY: ghcr.io
+    IMAGE_NAME: "${{ github.event.repository.name }}"
+    # Credentials for deployment to AWS
+    AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+    AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
 
 jobs:
- lint:
-  runs-on: ubuntu-latest
-  steps:
-  - name: Checkout
-    uses: actions/checkout@v2
-  - name: Set up Python 3.10
-    uses: actions/setup-python@v2
-    with:
-     python-version: '3.10'
-  - run: pip install flake8
-  - run: pip install mypy
-  - run: flake8 run.py facefusion tests
-  - run: mypy run.py facefusion tests
- test:
-  strategy:
-   matrix:
-    os: [ macos-latest, ubuntu-latest, windows-latest ]
-  runs-on: ${{ matrix.os }}
-  steps:
-  - name: Checkout
-    uses: actions/checkout@v2
-  - name: Set up ffmpeg
-    uses: FedericoCarboni/setup-ffmpeg@v2
-  - name: Set up Python 3.10
-    uses: actions/setup-python@v2
-    with:
-     python-version: '3.10'
-  - run: pip install -r requirements-ci.txt
-  - run: pytest
+    build:
+        environment: dev
+        permissions: write-all
+        runs-on: ubuntu-latest
+
+        strategy:
+            matrix:
+                build: [cpu, cuda]
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v3
+
+            - name: Log in to the Container registry
+              uses: docker/login-action@v2
+              with:
+                  registry: ${{ env.GITHUB_REGISTRY }}
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Build Docker Image
+              run: |
+                  docker build -f Dockerfile.${{ matrix.build }} -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+
+            - name: Tag and Push Docker Image to GitHub Container Registry
+              env:
+                  REGISTRY: ${{ env.GITHUB_REGISTRY }}
+                  REPOSITORY: getreallabs
+              run: |
+                  docker tag ${{ env.IMAGE_NAME }}:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}.${{ matrix.build }}
+                  docker tag ${{ env.IMAGE_NAME }}:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}.${{ matrix.build }}
+                  docker tag ${{ env.IMAGE_NAME }}:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}.${{ github.run_number }}.${{ matrix.build }}
+                  docker push -a ${{ env.REGISTRY }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}
+
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@v2
+              with:
+                  aws-region: ${{ vars.AWS_DEFAULT_REGION }}
+
+            - name: Login to Amazon ECR
+              id: login-ecr
+              uses: aws-actions/amazon-ecr-login@v1
+
+            - name: Tag and Push Docker Image to Amazon ECR
+              env:
+                  REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+                  REPOSITORY: getreallabs
+              run: |
+                  docker tag ${{ env.IMAGE_NAME }}:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.REPOSITORY }}:${{ github.sha }}.${{ matrix.build }}
+                  docker tag ${{ env.IMAGE_NAME }}:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.REPOSITORY }}:${{ env.IMAGE_NAME }}.${{ github.ref_name }}.${{ matrix.build }}
+                  docker tag ${{ env.IMAGE_NAME }}:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.REPOSITORY }}:${{ env.IMAGE_NAME }}.${{ github.ref_name }}.${{ github.run_number }}.${{ matrix.build }}
+                  docker push -a ${{ env.REGISTRY }}/${{ env.REPOSITORY }}
