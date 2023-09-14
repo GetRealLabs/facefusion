@@ -10,5 +10,4 @@ COPY requirements.cpu.txt .
 RUN pip install -r requirements.cpu.txt
 COPY . .
 
-ENTRYPOINT [ "python", "run.py" ]
-CMD ["-h"]
+ENTRYPOINT ["python", "run.py"]

@@ -11,5 +11,4 @@ COPY requirements.cuda.txt .
 RUN pip install -r requirements.cuda.txt
 COPY . .
 
-ENTRYPOINT [ "python", "run.py" ]
-CMD ["-h"]
+ENTRYPOINT ["python", "run.py"]
