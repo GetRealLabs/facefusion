@@ -2,7 +2,7 @@ basicsr==1.4.2
 gradio==3.47.1
 insightface==0.7.3
 numpy==1.24.3
-onnx==1.14.1
+onnx==1.17.0
 onnxruntime==1.16.0
 opencv-python==4.8.1.78
 opennsfw2==0.10.2
