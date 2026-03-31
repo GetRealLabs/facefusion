@@ -1,9 +1,9 @@
-from typing import Optional, List
+from typing import List, Optional
+
 import gradio
 
-import facefusion.globals
-from facefusion import wording
-from facefusion.uis import choices
+from facefusion import state_manager, translator
+from facefusion.uis import choices as uis_choices
 
 COMMON_OPTIONS_CHECKBOX_GROUP : Optional[gradio.Checkboxgroup] = None
 
@@ -11,19 +11,15 @@ COMMON_OPTIONS_CHECKBOX_GROUP : Optional[gradio.Checkboxgroup] = None
 def render() -> None:
 	global COMMON_OPTIONS_CHECKBOX_GROUP
 
-	value = []
-	if facefusion.globals.keep_fps:
-		value.append('keep-fps')
-	if facefusion.globals.keep_temp:
-		value.append('keep-temp')
-	if facefusion.globals.skip_audio:
-		value.append('skip-audio')
-	if facefusion.globals.skip_download:
-		value.append('skip-download')
+	common_options = []
+
+	if state_manager.get_item('keep_temp'):
+		common_options.append('keep-temp')
+
 	COMMON_OPTIONS_CHECKBOX_GROUP = gradio.Checkboxgroup(
-		label = wording.get('common_options_checkbox_group_label'),
-		choices = choices.common_options,
-		value = value
+		label = translator.get('uis.common_options_checkbox_group'),
+		choices = uis_choices.common_options,
+		value = common_options
 	)
 
 
@@ -32,7 +28,5 @@ def listen() -> None:
 
 
 def update(common_options : List[str]) -> None:
-	facefusion.globals.keep_fps = 'keep-fps' in common_options
-	facefusion.globals.keep_temp = 'keep-temp' in common_options
-	facefusion.globals.skip_audio = 'skip-audio' in common_options
-	facefusion.globals.skip_download = 'skip-download' in common_options
+	keep_temp = 'keep-temp' in common_options
+	state_manager.set_item('keep_temp', keep_temp)

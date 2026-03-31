@@ -1,257 +1,350 @@
-import os
-
-os.environ['OMP_NUM_THREADS'] = '1'
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-
+import inspect
+import itertools
+import shutil
 import signal
 import sys
-import warnings
-import platform
-import shutil
-import onnxruntime
-import tensorflow
-from argparse import ArgumentParser, HelpFormatter
+from time import time
 
-import facefusion.choices
-import facefusion.globals
-from facefusion import metadata, wording
-from facefusion.predictor import predict_image, predict_video
-from facefusion.processors.frame.core import get_frame_processors_modules, load_frame_processor_module
-from facefusion.utilities import is_image, is_video, detect_fps, compress_image, merge_video, extract_frames, get_temp_frame_paths, restore_audio, create_temp, move_temp, clear_temp, list_module_names, encode_execution_providers, decode_execution_providers, normalize_output_path
-
-warnings.filterwarnings('ignore', category = FutureWarning, module = 'insightface')
-warnings.filterwarnings('ignore', category = UserWarning, module = 'torchvision')
+from facefusion import benchmarker, cli_helper, content_analyser, face_classifier, face_detector, face_landmarker, face_masker, face_recognizer, hash_helper, logger, state_manager, translator, voice_extractor
+from facefusion.args import apply_args, collect_job_args, reduce_job_args, reduce_step_args
+from facefusion.download import conditional_download_hashes, conditional_download_sources
+from facefusion.exit_helper import hard_exit, signal_exit
+from facefusion.filesystem import get_file_extension, get_file_name, is_image, is_video, resolve_file_paths, resolve_file_pattern
+from facefusion.jobs import job_helper, job_manager, job_runner
+from facefusion.jobs.job_list import compose_job_list
+from facefusion.memory import limit_system_memory
+from facefusion.processors.core import get_processors_modules
+from facefusion.program import create_program
+from facefusion.program_helper import validate_args
+from facefusion.types import Args, ErrorCode
+from facefusion.workflows import image_to_image, image_to_video
 
 
 def cli() -> None:
-	signal.signal(signal.SIGINT, lambda signal_number, frame: destroy())
-	program = ArgumentParser(formatter_class = lambda prog: HelpFormatter(prog, max_help_position = 120), add_help = False)
-	# general
-	program.add_argument('-s', '--source', help = wording.get('source_help'), dest = 'source_path')
-	program.add_argument('-t', '--target', help = wording.get('target_help'), dest = 'target_path')
-	program.add_argument('-o', '--output', help = wording.get('output_help'), dest = 'output_path')
-	program.add_argument('-v', '--version', version = metadata.get('name') + ' ' + metadata.get('version'), action = 'version')
-	# misc
-	group_misc = program.add_argument_group('misc')
-	group_misc.add_argument('--skip-download', help = wording.get('skip_download_help'), dest = 'skip_download', action = 'store_true')
-	group_misc.add_argument('--headless', help = wording.get('headless_help'), dest = 'headless', action = 'store_true')
-	# execution
-	group_execution = program.add_argument_group('execution')
-	group_execution.add_argument('--execution-providers', help = wording.get('execution_providers_help').format(choices = 'cpu'), dest = 'execution_providers', default = [ 'cpu' ], choices = encode_execution_providers(onnxruntime.get_available_providers()), nargs = '+')
-	group_execution.add_argument('--execution-thread-count', help = wording.get('execution_thread_count_help'), dest = 'execution_thread_count', type = int, default = 1)
-	group_execution.add_argument('--execution-queue-count', help = wording.get('execution_queue_count_help'), dest = 'execution_queue_count', type = int, default = 1)
-	group_execution.add_argument('--max-memory', help=wording.get('max_memory_help'), dest='max_memory', type = int)
-	# face recognition
-	group_face_recognition = program.add_argument_group('face recognition')
-	group_face_recognition.add_argument('--face-recognition', help = wording.get('face_recognition_help'), dest = 'face_recognition', default = 'reference', choices = facefusion.choices.face_recognitions)
-	group_face_recognition.add_argument('--face-analyser-direction', help = wording.get('face_analyser_direction_help'), dest = 'face_analyser_direction', default = 'left-right', choices = facefusion.choices.face_analyser_directions)
-	group_face_recognition.add_argument('--face-analyser-age', help = wording.get('face_analyser_age_help'), dest = 'face_analyser_age', choices = facefusion.choices.face_analyser_ages)
-	group_face_recognition.add_argument('--face-analyser-gender', help = wording.get('face_analyser_gender_help'), dest = 'face_analyser_gender', choices = facefusion.choices.face_analyser_genders)
-	group_face_recognition.add_argument('--reference-face-position', help = wording.get('reference_face_position_help'), dest = 'reference_face_position', type = int, default = 0)
-	group_face_recognition.add_argument('--reference-face-distance', help = wording.get('reference_face_distance_help'), dest = 'reference_face_distance', type = float, default = 1.5)
-	group_face_recognition.add_argument('--reference-frame-number', help = wording.get('reference_frame_number_help'), dest = 'reference_frame_number', type = int, default = 0)
-	# frame extraction
-	group_processing = program.add_argument_group('frame extraction')
-	group_processing.add_argument('--trim-frame-start', help = wording.get('trim_frame_start_help'), dest = 'trim_frame_start', type = int)
-	group_processing.add_argument('--trim-frame-end', help = wording.get('trim_frame_end_help'), dest = 'trim_frame_end', type = int)
-	group_processing.add_argument('--temp-frame-format', help = wording.get('temp_frame_format_help'), dest = 'temp_frame_format', default = 'jpg', choices = facefusion.choices.temp_frame_formats)
-	group_processing.add_argument('--temp-frame-quality', help = wording.get('temp_frame_quality_help'), dest = 'temp_frame_quality', type = int, default = 100, choices = range(101), metavar = '[0-100]')
-	group_processing.add_argument('--keep-temp', help = wording.get('keep_temp_help'), dest = 'keep_temp', action = 'store_true')
-	# output creation
-	group_output = program.add_argument_group('output creation')
-	group_output.add_argument('--output-image-quality', help=wording.get('output_image_quality_help'), dest = 'output_image_quality', type = int, default = 80, choices = range(101), metavar = '[0-100]')
-	group_output.add_argument('--output-video-encoder', help = wording.get('output_video_encoder_help'), dest = 'output_video_encoder', default = 'libx264', choices = facefusion.choices.output_video_encoders)
-	group_output.add_argument('--output-video-quality', help = wording.get('output_video_quality_help'), dest = 'output_video_quality', type = int, default = 80, choices = range(101), metavar = '[0-100]')
-	group_output.add_argument('--keep-fps', help = wording.get('keep_fps_help'), dest = 'keep_fps', action = 'store_true')
-	group_output.add_argument('--skip-audio', help = wording.get('skip_audio_help'), dest = 'skip_audio', action = 'store_true')
-	# frame processors
-	available_frame_processors = list_module_names('facefusion/processors/frame/modules')
-	program = ArgumentParser(parents = [ program ], formatter_class = program.formatter_class, add_help = True)
-	group_frame_processors = program.add_argument_group('frame processors')
-	group_frame_processors.add_argument('--frame-processors', help = wording.get('frame_processors_help').format(choices = ', '.join(available_frame_processors)), dest = 'frame_processors', default = [ 'face_swapper' ], nargs = '+')
-	for frame_processor in available_frame_processors:
-		frame_processor_module = load_frame_processor_module(frame_processor)
-		frame_processor_module.register_args(group_frame_processors)
-	# uis
-	group_uis = program.add_argument_group('uis')
-	group_uis.add_argument('--ui-layouts', help = wording.get('ui_layouts_help').format(choices = ', '.join(list_module_names('facefusion/uis/layouts'))), dest = 'ui_layouts', default = [ 'default' ], nargs = '+')
-	run(program)
+	if pre_check():
+		signal.signal(signal.SIGINT, signal_exit)
+		program = create_program()
 
+		if validate_args(program):
+			args = vars(program.parse_args())
+			apply_args(args, state_manager.init_item)
 
-def apply_args(program : ArgumentParser) -> None:
-	args = program.parse_args()
-	# general
-	facefusion.globals.source_path = args.source_path
-	facefusion.globals.target_path = args.target_path
-	facefusion.globals.output_path = normalize_output_path(facefusion.globals.source_path, facefusion.globals.target_path, args.output_path)
-	# misc
-	facefusion.globals.skip_download = args.skip_download
-	facefusion.globals.headless = args.headless
-	# execution
-	facefusion.globals.execution_providers = decode_execution_providers(args.execution_providers)
-	facefusion.globals.execution_thread_count = args.execution_thread_count
-	facefusion.globals.execution_queue_count = args.execution_queue_count
-	facefusion.globals.max_memory = args.max_memory
-	# face recognition
-	facefusion.globals.face_recognition = args.face_recognition
-	facefusion.globals.face_analyser_direction = args.face_analyser_direction
-	facefusion.globals.face_analyser_age = args.face_analyser_age
-	facefusion.globals.face_analyser_gender = args.face_analyser_gender
-	facefusion.globals.reference_face_position = args.reference_face_position
-	facefusion.globals.reference_face_distance = args.reference_face_distance
-	facefusion.globals.reference_frame_number = args.reference_frame_number
-	# frame extraction
-	facefusion.globals.trim_frame_start = args.trim_frame_start
-	facefusion.globals.trim_frame_end = args.trim_frame_end
-	facefusion.globals.temp_frame_format = args.temp_frame_format
-	facefusion.globals.temp_frame_quality = args.temp_frame_quality
-	facefusion.globals.keep_temp = args.keep_temp
-	# output creation
-	facefusion.globals.output_image_quality = args.output_image_quality
-	facefusion.globals.output_video_encoder = args.output_video_encoder
-	facefusion.globals.output_video_quality = args.output_video_quality
-	facefusion.globals.keep_fps = args.keep_fps
-	facefusion.globals.skip_audio = args.skip_audio
-	# frame processors
-	available_frame_processors = list_module_names('facefusion/processors/frame/modules')
-	facefusion.globals.frame_processors = args.frame_processors
-	for frame_processor in available_frame_processors:
-		frame_processor_module = load_frame_processor_module(frame_processor)
-		frame_processor_module.apply_args(program)
-	# uis
-	facefusion.globals.ui_layouts = args.ui_layouts
-
-
-def run(program : ArgumentParser) -> None:
-	apply_args(program)
-	limit_resources()
-	if not pre_check():
-		return
-	for frame_processor_module in get_frame_processors_modules(facefusion.globals.frame_processors):
-		if not frame_processor_module.pre_check():
-			return
-	if facefusion.globals.headless:
-		conditional_process()
+			if state_manager.get_item('command'):
+				logger.init(state_manager.get_item('log_level'))
+				route(args)
+			else:
+				program.print_help()
+		else:
+			hard_exit(2)
 	else:
+		hard_exit(2)
+
+
+def route(args : Args) -> None:
+	system_memory_limit = state_manager.get_item('system_memory_limit')
+
+	if system_memory_limit and system_memory_limit > 0:
+		limit_system_memory(system_memory_limit)
+
+	if state_manager.get_item('command') == 'force-download':
+		error_code = force_download()
+		hard_exit(error_code)
+
+	if state_manager.get_item('command') == 'benchmark':
+		if not common_pre_check() or not processors_pre_check() or not benchmarker.pre_check():
+			hard_exit(2)
+		benchmarker.render()
+
+	if state_manager.get_item('command') in [ 'job-list', 'job-create', 'job-submit', 'job-submit-all', 'job-delete', 'job-delete-all', 'job-add-step', 'job-remix-step', 'job-insert-step', 'job-remove-step' ]:
+		if not job_manager.init_jobs(state_manager.get_item('jobs_path')):
+			hard_exit(1)
+		error_code = route_job_manager(args)
+		hard_exit(error_code)
+
+	if state_manager.get_item('command') == 'run':
 		import facefusion.uis.core as ui
 
-		for ui_layout in ui.get_ui_layouts_modules(facefusion.globals.ui_layouts):
+		if not common_pre_check() or not processors_pre_check():
+			hard_exit(2)
+		for ui_layout in ui.get_ui_layouts_modules(state_manager.get_item('ui_layouts')):
 			if not ui_layout.pre_check():
-				return
+				hard_exit(2)
+		ui.init()
 		ui.launch()
 
+	if state_manager.get_item('command') == 'headless-run':
+		if not job_manager.init_jobs(state_manager.get_item('jobs_path')):
+			hard_exit(1)
+		error_code = process_headless(args)
+		hard_exit(error_code)
 
-def destroy() -> None:
-	if facefusion.globals.target_path:
-		clear_temp(facefusion.globals.target_path)
-	sys.exit()
+	if state_manager.get_item('command') == 'batch-run':
+		if not job_manager.init_jobs(state_manager.get_item('jobs_path')):
+			hard_exit(1)
+		error_code = process_batch(args)
+		hard_exit(error_code)
 
-
-def limit_resources() -> None:
-	# prevent tensorflow memory leak
-	gpus = tensorflow.config.experimental.list_physical_devices('GPU')
-	for gpu in gpus:
-		tensorflow.config.experimental.set_virtual_device_configuration(gpu,
-		[
-			tensorflow.config.experimental.VirtualDeviceConfiguration(memory_limit = 512)
-		])
-	# limit memory usage
-	if facefusion.globals.max_memory:
-		memory = facefusion.globals.max_memory * 1024 ** 3
-		if platform.system().lower() == 'darwin':
-			memory = facefusion.globals.max_memory * 1024 ** 6
-		if platform.system().lower() == 'windows':
-			import ctypes
-			kernel32 = ctypes.windll.kernel32 # type: ignore[attr-defined]
-			kernel32.SetProcessWorkingSetSize(-1, ctypes.c_size_t(memory), ctypes.c_size_t(memory))
-		else:
-			import resource
-			resource.setrlimit(resource.RLIMIT_DATA, (memory, memory))
+	if state_manager.get_item('command') in [ 'job-run', 'job-run-all', 'job-retry', 'job-retry-all' ]:
+		if not job_manager.init_jobs(state_manager.get_item('jobs_path')):
+			hard_exit(1)
+		error_code = route_job_runner()
+		hard_exit(error_code)
 
 
 def pre_check() -> bool:
-	if sys.version_info < (3, 9):
-		update_status(wording.get('python_not_supported').format(version = '3.9'))
+	if sys.version_info < (3, 10):
+		logger.error(translator.get('python_not_supported').format(version = '3.10'), __name__)
 		return False
+
+	if not shutil.which('curl'):
+		logger.error(translator.get('curl_not_installed'), __name__)
+		return False
+
 	if not shutil.which('ffmpeg'):
-		update_status(wording.get('ffmpeg_not_installed'))
+		logger.error(translator.get('ffmpeg_not_installed'), __name__)
 		return False
 	return True
 
 
-def conditional_process() -> None:
-	for frame_processor_module in get_frame_processors_modules(facefusion.globals.frame_processors):
-		if not frame_processor_module.pre_process('output'):
-			return
-	if is_image(facefusion.globals.target_path):
-		process_image()
-	if is_video(facefusion.globals.target_path):
-		process_video()
+def common_pre_check() -> bool:
+	common_modules =\
+	[
+		content_analyser,
+		face_classifier,
+		face_detector,
+		face_landmarker,
+		face_masker,
+		face_recognizer,
+		voice_extractor
+	]
+
+	content_analyser_content = inspect.getsource(content_analyser).encode()
+	content_analyser_hash = hash_helper.create_hash(content_analyser_content)
+
+	return all(module.pre_check() for module in common_modules) and content_analyser_hash == 'b14e7b92'
 
 
-def process_image() -> None:
-	if predict_image(facefusion.globals.target_path):
-		return
-	shutil.copy2(facefusion.globals.target_path, facefusion.globals.output_path)
-	# process frame
-	for frame_processor_module in get_frame_processors_modules(facefusion.globals.frame_processors):
-		update_status(wording.get('processing'), frame_processor_module.NAME)
-		frame_processor_module.process_image(facefusion.globals.source_path, facefusion.globals.output_path, facefusion.globals.output_path)
-		frame_processor_module.post_process()
-	# compress image
-	update_status(wording.get('compressing_image'))
-	if not compress_image(facefusion.globals.output_path):
-		update_status(wording.get('compressing_image_failed'))
-	# validate image
-	if is_image(facefusion.globals.target_path):
-		update_status(wording.get('processing_image_succeed'))
-	else:
-		update_status(wording.get('processing_image_failed'))
+def processors_pre_check() -> bool:
+	for processor_module in get_processors_modules(state_manager.get_item('processors')):
+		if not processor_module.pre_check():
+			return False
+	return True
 
 
-def process_video() -> None:
-	if predict_video(facefusion.globals.target_path):
-		return
-	fps = detect_fps(facefusion.globals.target_path) if facefusion.globals.keep_fps else 25.0
-	# create temp
-	update_status(wording.get('creating_temp'))
-	create_temp(facefusion.globals.target_path)
-	# extract frames
-	update_status(wording.get('extracting_frames_fps').format(fps = fps))
-	extract_frames(facefusion.globals.target_path, fps)
-	# process frame
-	temp_frame_paths = get_temp_frame_paths(facefusion.globals.target_path)
-	if temp_frame_paths:
-		for frame_processor_module in get_frame_processors_modules(facefusion.globals.frame_processors):
-			update_status(wording.get('processing'), frame_processor_module.NAME)
-			frame_processor_module.process_video(facefusion.globals.source_path, temp_frame_paths)
-			frame_processor_module.post_process()
-	else:
-		update_status(wording.get('temp_frames_not_found'))
-		return
-	# merge video
-	update_status(wording.get('merging_video_fps').format(fps = fps))
-	if not merge_video(facefusion.globals.target_path, fps):
-		update_status(wording.get('merging_video_failed'))
-		return
-	# handle audio
-	if facefusion.globals.skip_audio:
-		update_status(wording.get('skipping_audio'))
-		move_temp(facefusion.globals.target_path, facefusion.globals.output_path)
-	else:
-		update_status(wording.get('restoring_audio'))
-		if not restore_audio(facefusion.globals.target_path, facefusion.globals.output_path):
-			update_status(wording.get('restoring_audio_failed'))
-			move_temp(facefusion.globals.target_path, facefusion.globals.output_path)
-	# clear temp
-	update_status(wording.get('clearing_temp'))
-	clear_temp(facefusion.globals.target_path)
-	# validate video
-	if is_video(facefusion.globals.target_path):
-		update_status(wording.get('processing_video_succeed'))
-	else:
-		update_status(wording.get('processing_video_failed'))
+def force_download() -> ErrorCode:
+	common_modules =\
+	[
+		content_analyser,
+		face_classifier,
+		face_detector,
+		face_landmarker,
+		face_masker,
+		face_recognizer,
+		voice_extractor
+	]
+	available_processors = [ get_file_name(file_path) for file_path in resolve_file_paths('facefusion/processors/modules') ]
+	processor_modules = get_processors_modules(available_processors)
+
+	for module in common_modules + processor_modules:
+		if hasattr(module, 'create_static_model_set'):
+			for model in module.create_static_model_set(state_manager.get_item('download_scope')).values():
+				model_hash_set = model.get('hashes')
+				model_source_set = model.get('sources')
+
+				if model_hash_set and model_source_set:
+					if not conditional_download_hashes(model_hash_set) or not conditional_download_sources(model_source_set):
+						return 1
+
+	return 0
 
 
-def update_status(message : str, scope : str = 'FACEFUSION.CORE') -> None:
-	print('[' + scope + '] ' + message)
+def route_job_manager(args : Args) -> ErrorCode:
+	if state_manager.get_item('command') == 'job-list':
+		job_headers, job_contents = compose_job_list(state_manager.get_item('job_status'))
+
+		if job_contents:
+			cli_helper.render_table(job_headers, job_contents)
+			return 0
+		return 1
+
+	if state_manager.get_item('command') == 'job-create':
+		if job_manager.create_job(state_manager.get_item('job_id')):
+			logger.info(translator.get('job_created').format(job_id = state_manager.get_item('job_id')), __name__)
+			return 0
+		logger.error(translator.get('job_not_created').format(job_id = state_manager.get_item('job_id')), __name__)
+		return 1
+
+	if state_manager.get_item('command') == 'job-submit':
+		if job_manager.submit_job(state_manager.get_item('job_id')):
+			logger.info(translator.get('job_submitted').format(job_id = state_manager.get_item('job_id')), __name__)
+			return 0
+		logger.error(translator.get('job_not_submitted').format(job_id = state_manager.get_item('job_id')), __name__)
+		return 1
+
+	if state_manager.get_item('command') == 'job-submit-all':
+		if job_manager.submit_jobs(state_manager.get_item('halt_on_error')):
+			logger.info(translator.get('job_all_submitted'), __name__)
+			return 0
+		logger.error(translator.get('job_all_not_submitted'), __name__)
+		return 1
+
+	if state_manager.get_item('command') == 'job-delete':
+		if job_manager.delete_job(state_manager.get_item('job_id')):
+			logger.info(translator.get('job_deleted').format(job_id = state_manager.get_item('job_id')), __name__)
+			return 0
+		logger.error(translator.get('job_not_deleted').format(job_id = state_manager.get_item('job_id')), __name__)
+		return 1
+
+	if state_manager.get_item('command') == 'job-delete-all':
+		if job_manager.delete_jobs(state_manager.get_item('halt_on_error')):
+			logger.info(translator.get('job_all_deleted'), __name__)
+			return 0
+		logger.error(translator.get('job_all_not_deleted'), __name__)
+		return 1
+
+	if state_manager.get_item('command') == 'job-add-step':
+		step_args = reduce_step_args(args)
+
+		if job_manager.add_step(state_manager.get_item('job_id'), step_args):
+			logger.info(translator.get('job_step_added').format(job_id = state_manager.get_item('job_id')), __name__)
+			return 0
+		logger.error(translator.get('job_step_not_added').format(job_id = state_manager.get_item('job_id')), __name__)
+		return 1
+
+	if state_manager.get_item('command') == 'job-remix-step':
+		step_args = reduce_step_args(args)
+
+		if job_manager.remix_step(state_manager.get_item('job_id'), state_manager.get_item('step_index'), step_args):
+			logger.info(translator.get('job_remix_step_added').format(job_id = state_manager.get_item('job_id'), step_index = state_manager.get_item('step_index')), __name__)
+			return 0
+		logger.error(translator.get('job_remix_step_not_added').format(job_id = state_manager.get_item('job_id'), step_index = state_manager.get_item('step_index')), __name__)
+		return 1
+
+	if state_manager.get_item('command') == 'job-insert-step':
+		step_args = reduce_step_args(args)
+
+		if job_manager.insert_step(state_manager.get_item('job_id'), state_manager.get_item('step_index'), step_args):
+			logger.info(translator.get('job_step_inserted').format(job_id = state_manager.get_item('job_id'), step_index = state_manager.get_item('step_index')), __name__)
+			return 0
+		logger.error(translator.get('job_step_not_inserted').format(job_id = state_manager.get_item('job_id'), step_index = state_manager.get_item('step_index')), __name__)
+		return 1
+
+	if state_manager.get_item('command') == 'job-remove-step':
+		if job_manager.remove_step(state_manager.get_item('job_id'), state_manager.get_item('step_index')):
+			logger.info(translator.get('job_step_removed').format(job_id = state_manager.get_item('job_id'), step_index = state_manager.get_item('step_index')), __name__)
+			return 0
+		logger.error(translator.get('job_step_not_removed').format(job_id = state_manager.get_item('job_id'), step_index = state_manager.get_item('step_index')), __name__)
+		return 1
+	return 1
+
+
+def route_job_runner() -> ErrorCode:
+	if state_manager.get_item('command') == 'job-run':
+		logger.info(translator.get('running_job').format(job_id = state_manager.get_item('job_id')), __name__)
+		if job_runner.run_job(state_manager.get_item('job_id'), process_step):
+			logger.info(translator.get('processing_job_succeeded').format(job_id = state_manager.get_item('job_id')), __name__)
+			return 0
+		logger.info(translator.get('processing_job_failed').format(job_id = state_manager.get_item('job_id')), __name__)
+		return 1
+
+	if state_manager.get_item('command') == 'job-run-all':
+		logger.info(translator.get('running_jobs'), __name__)
+		if job_runner.run_jobs(process_step, state_manager.get_item('halt_on_error')):
+			logger.info(translator.get('processing_jobs_succeeded'), __name__)
+			return 0
+		logger.info(translator.get('processing_jobs_failed'), __name__)
+		return 1
+
+	if state_manager.get_item('command') == 'job-retry':
+		logger.info(translator.get('retrying_job').format(job_id = state_manager.get_item('job_id')), __name__)
+		if job_runner.retry_job(state_manager.get_item('job_id'), process_step):
+			logger.info(translator.get('processing_job_succeeded').format(job_id = state_manager.get_item('job_id')), __name__)
+			return 0
+		logger.info(translator.get('processing_job_failed').format(job_id = state_manager.get_item('job_id')), __name__)
+		return 1
+
+	if state_manager.get_item('command') == 'job-retry-all':
+		logger.info(translator.get('retrying_jobs'), __name__)
+		if job_runner.retry_jobs(process_step, state_manager.get_item('halt_on_error')):
+			logger.info(translator.get('processing_jobs_succeeded'), __name__)
+			return 0
+		logger.info(translator.get('processing_jobs_failed'), __name__)
+		return 1
+	return 2
+
+
+def process_headless(args : Args) -> ErrorCode:
+	job_id = job_helper.suggest_job_id('headless')
+	step_args = reduce_step_args(args)
+
+	if job_manager.create_job(job_id) and job_manager.add_step(job_id, step_args) and job_manager.submit_job(job_id) and job_runner.run_job(job_id, process_step):
+		return 0
+	return 1
+
+
+def process_batch(args : Args) -> ErrorCode:
+	job_id = job_helper.suggest_job_id('batch')
+	step_args = reduce_step_args(args)
+	job_args = reduce_job_args(args)
+	source_paths = resolve_file_pattern(job_args.get('source_pattern'))
+	target_paths = resolve_file_pattern(job_args.get('target_pattern'))
+
+	if job_manager.create_job(job_id):
+		if source_paths and target_paths:
+			for index, (source_path, target_path) in enumerate(itertools.product(source_paths, target_paths)):
+				step_args['source_paths'] = [ source_path ]
+				step_args['target_path'] = target_path
+
+				try:
+					step_args['output_path'] = job_args.get('output_pattern').format(index = index, source_name = get_file_name(source_path), target_name = get_file_name(target_path), target_extension = get_file_extension(target_path))
+				except KeyError:
+					return 1
+
+				if not job_manager.add_step(job_id, step_args):
+					return 1
+			if job_manager.submit_job(job_id) and job_runner.run_job(job_id, process_step):
+				return 0
+
+		if not source_paths and target_paths:
+			for index, target_path in enumerate(target_paths):
+				step_args['target_path'] = target_path
+
+				try:
+					step_args['output_path'] = job_args.get('output_pattern').format(index = index, target_name = get_file_name(target_path), target_extension = get_file_extension(target_path))
+				except KeyError:
+					return 1
+
+				if not job_manager.add_step(job_id, step_args):
+					return 1
+			if job_manager.submit_job(job_id) and job_runner.run_job(job_id, process_step):
+				return 0
+	return 1
+
+
+def process_step(job_id : str, step_index : int, step_args : Args) -> bool:
+	step_total = job_manager.count_step_total(job_id)
+	step_args.update(collect_job_args())
+	apply_args(step_args, state_manager.set_item)
+
+	logger.info(translator.get('processing_step').format(step_current = step_index + 1, step_total = step_total), __name__)
+	if common_pre_check() and processors_pre_check():
+		error_code = conditional_process()
+		return error_code == 0
+	return False
+
+
+def conditional_process() -> ErrorCode:
+	start_time = time()
+
+	for processor_module in get_processors_modules(state_manager.get_item('processors')):
+		if not processor_module.pre_process('output'):
+			return 2
+
+	if is_image(state_manager.get_item('target_path')):
+		return image_to_image.process(start_time)
+	if is_video(state_manager.get_item('target_path')):
+		return image_to_video.process(start_time)
+
+	return 0
+
+

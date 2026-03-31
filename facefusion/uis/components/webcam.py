@@ -1,132 +1,162 @@
-from typing import Optional, Generator, Deque
-from concurrent.futures import ThreadPoolExecutor
-from collections import deque
-import os
-import platform
-import subprocess
+from typing import Iterator, List, Optional, Tuple
+
 import cv2
 import gradio
-from tqdm import tqdm
+import numpy
 
-import facefusion.globals
-from facefusion import wording
-from facefusion.predictor import predict_stream
-from facefusion.typing import Frame, Face
-from facefusion.face_analyser import get_one_face
-from facefusion.processors.frame.core import get_frame_processors_modules
-from facefusion.utilities import open_ffmpeg
-from facefusion.vision import normalize_frame_color, read_static_image
-from facefusion.uis.typing import StreamMode, WebcamMode
+from facefusion import logger, state_manager, translator
+from facefusion.camera_manager import clear_camera_pool, get_local_camera_capture
+from facefusion.filesystem import has_image
+from facefusion.streamer import multi_process_capture, open_stream, open_virtual_camera
+from facefusion.types import Fps, VisionFrame, WebcamMode
 from facefusion.uis.core import get_ui_component
+from facefusion.uis.types import File
+from facefusion.vision import fit_cover_frame, unpack_resolution
 
+SOURCE_FILE : Optional[gradio.File] = None
 WEBCAM_IMAGE : Optional[gradio.Image] = None
 WEBCAM_START_BUTTON : Optional[gradio.Button] = None
 WEBCAM_STOP_BUTTON : Optional[gradio.Button] = None
 
 
 def render() -> None:
+	global SOURCE_FILE
 	global WEBCAM_IMAGE
 	global WEBCAM_START_BUTTON
 	global WEBCAM_STOP_BUTTON
 
+	has_source_image = has_image(state_manager.get_item('source_paths'))
+	SOURCE_FILE = gradio.File(
+		label = translator.get('uis.source_file'),
+		file_count = 'multiple',
+		value = state_manager.get_item('source_paths') if has_source_image else None
+	)
 	WEBCAM_IMAGE = gradio.Image(
-		label = wording.get('webcam_image_label')
+		label = translator.get('uis.webcam_image'),
+		format = 'jpeg',
+		visible = False
 	)
 	WEBCAM_START_BUTTON = gradio.Button(
-		value = wording.get('start_button_label'),
+		value = translator.get('uis.start_button'),
 		variant = 'primary',
 		size = 'sm'
 	)
 	WEBCAM_STOP_BUTTON = gradio.Button(
-		value = wording.get('stop_button_label'),
-		size = 'sm'
+		value = translator.get('uis.stop_button'),
+		size = 'sm',
+		visible = False
 	)
 
 
 def listen() -> None:
-	start_event = None
+	SOURCE_FILE.change(update_source, inputs = SOURCE_FILE, outputs = SOURCE_FILE)
+	webcam_device_id_dropdown = get_ui_component('webcam_device_id_dropdown')
 	webcam_mode_radio = get_ui_component('webcam_mode_radio')
 	webcam_resolution_dropdown = get_ui_component('webcam_resolution_dropdown')
 	webcam_fps_slider = get_ui_component('webcam_fps_slider')
-	if webcam_mode_radio and webcam_resolution_dropdown and webcam_fps_slider:
-		start_event = WEBCAM_START_BUTTON.click(start, inputs = [ webcam_mode_radio, webcam_resolution_dropdown, webcam_fps_slider ], outputs = WEBCAM_IMAGE)
-		webcam_mode_radio.change(stop, outputs = WEBCAM_IMAGE, cancels = start_event)
-		webcam_resolution_dropdown.change(stop, outputs = WEBCAM_IMAGE, cancels = start_event)
-		webcam_fps_slider.change(stop, outputs = WEBCAM_IMAGE, cancels = start_event)
-	WEBCAM_STOP_BUTTON.click(stop, cancels = start_event)
-	source_image = get_ui_component('source_image')
-	if source_image:
-		for method in [ 'upload', 'change', 'clear' ]:
-			getattr(source_image, method)(stop, cancels = start_event)
+
+	if webcam_device_id_dropdown and webcam_mode_radio and webcam_resolution_dropdown and webcam_fps_slider:
+		WEBCAM_START_BUTTON.click(pre_start, outputs = [ SOURCE_FILE, WEBCAM_IMAGE, WEBCAM_START_BUTTON, WEBCAM_STOP_BUTTON ])
+		start_event = WEBCAM_START_BUTTON.click(start, inputs = [ webcam_device_id_dropdown, webcam_mode_radio, webcam_resolution_dropdown, webcam_fps_slider ], outputs = WEBCAM_IMAGE)
+		start_event.then(pre_stop)
+		WEBCAM_STOP_BUTTON.click(stop, cancels = start_event, outputs = WEBCAM_IMAGE)
+		WEBCAM_STOP_BUTTON.click(pre_stop, outputs = [ SOURCE_FILE, WEBCAM_IMAGE, WEBCAM_START_BUTTON, WEBCAM_STOP_BUTTON ])
 
 
-def start(mode: WebcamMode, resolution: str, fps: float) -> Generator[Frame, None, None]:
-	facefusion.globals.face_recognition = 'many'
-	source_face = get_one_face(read_static_image(facefusion.globals.source_path))
+def update_source(files : List[File]) -> gradio.File:
+	file_names = [ file.name for file in files ] if files else None
+	has_source_image = has_image(file_names)
+
+	if has_source_image:
+		state_manager.set_item('source_paths', file_names)
+		return gradio.File(value = file_names)
+
+	state_manager.clear_item('source_paths')
+	return gradio.File(value = None)
+
+
+def pre_start() -> Tuple[gradio.File, gradio.Image, gradio.Button, gradio.Button]:
+	return gradio.File(visible = False), gradio.Image(visible = True), gradio.Button(visible = False), gradio.Button(visible = True)
+
+
+def pre_stop() -> Tuple[gradio.File, gradio.Image, gradio.Button, gradio.Button]:
+	return gradio.File(visible = True), gradio.Image(visible = False), gradio.Button(visible = True), gradio.Button(visible = False)
+
+
+def start(webcam_device_id : int, webcam_mode : WebcamMode, webcam_resolution : str, webcam_fps : Fps) -> Iterator[VisionFrame]:
+	state_manager.init_item('face_selector_mode', 'one')
+	state_manager.sync_state()
+
+	if not isinstance(webcam_device_id, int):
+		logger.error(translator.get('camera_not_loaded').format(camera_id = webcam_device_id), __name__)
+		return
+
+	camera_capture = get_local_camera_capture(webcam_device_id)
 	stream = None
-	if mode in [ 'udp', 'v4l2' ]:
-		stream = open_stream(mode, resolution, fps) # type: ignore[arg-type]
-	capture = capture_webcam(resolution, fps)
-	if capture.isOpened():
-		for capture_frame in multi_process_capture(source_face, capture):
-			if stream is not None:
-				stream.stdin.write(capture_frame.tobytes())
-			yield normalize_frame_color(capture_frame)
+	virtual_camera = None
+	can_send_bgr = False
+	webcam_width, webcam_height = unpack_resolution(webcam_resolution)
 
+	if not camera_capture or not camera_capture.isOpened():
+		logger.error(translator.get('camera_not_loaded').format(camera_id = webcam_device_id), __name__)
+		clear_camera_pool()
+		return
 
-def multi_process_capture(source_face: Face, capture : cv2.VideoCapture) -> Generator[Frame, None, None]:
-	progress = tqdm(desc = wording.get('processing'), unit = 'frame', dynamic_ncols = True)
-	with ThreadPoolExecutor(max_workers = facefusion.globals.execution_thread_count) as executor:
-		futures = []
-		deque_capture_frames : Deque[Frame] = deque()
-		while True:
-			_, capture_frame = capture.read()
-			if predict_stream(capture_frame):
-				return
-			future = executor.submit(process_stream_frame, source_face, capture_frame)
-			futures.append(future)
-			for future_done in [ future for future in futures if future.done() ]:
-				capture_frame = future_done.result()
-				deque_capture_frames.append(capture_frame)
-				futures.remove(future_done)
-			while deque_capture_frames:
-				yield deque_capture_frames.popleft()
-				progress.update()
+	if webcam_mode in [ 'udp', 'v4l2' ]:
+		stream = open_stream(webcam_mode, webcam_resolution, webcam_fps) #type:ignore[arg-type]
+	if webcam_mode == 'virtualcam':
+		virtual_camera_data = open_virtual_camera(webcam_resolution, webcam_fps)
+
+		if not virtual_camera_data:
+			return
+
+		virtual_camera, can_send_bgr = virtual_camera_data
+
+	try:
+		if camera_capture and camera_capture.isOpened():
+			camera_capture.set(cv2.CAP_PROP_FRAME_WIDTH, webcam_width)
+			camera_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, webcam_height)
+			camera_capture.set(cv2.CAP_PROP_FPS, webcam_fps)
+
+			for capture_vision_frame in multi_process_capture(camera_capture, webcam_fps):
+				capture_vision_frame = fit_cover_frame(capture_vision_frame, (webcam_width, webcam_height))
+				capture_vision_frame = numpy.ascontiguousarray(capture_vision_frame)
+
+				if webcam_mode == 'virtualcam' and virtual_camera:
+					if not can_send_bgr:
+						capture_vision_frame = cv2.cvtColor(capture_vision_frame, cv2.COLOR_BGR2RGB)
+					virtual_camera.send(capture_vision_frame)
+					virtual_camera.sleep_until_next_frame()
+					continue
+
+				capture_vision_frame = cv2.cvtColor(capture_vision_frame, cv2.COLOR_BGR2RGB)
+
+				if webcam_mode == 'inline':
+					yield capture_vision_frame
+				if webcam_mode in [ 'udp', 'v4l2' ] and stream and stream.stdin:
+					try:
+						stream.stdin.write(capture_vision_frame.tobytes())
+					except Exception:
+						pass
+	finally:
+		if stream and stream.stdin:
+			try:
+				stream.stdin.close()
+			except Exception:
+				pass
+
+		if stream:
+			try:
+				stream.terminate()
+			except Exception:
+				pass
+
+		if virtual_camera:
+			virtual_camera.close()
+
+		clear_camera_pool()
 
 
 def stop() -> gradio.Image:
+	clear_camera_pool()
 	return gradio.Image(value = None)
-
-
-def capture_webcam(resolution : str, fps : float) -> cv2.VideoCapture:
-	width, height = resolution.split('x')
-	if platform.system().lower() == 'windows':
-		capture = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-	else:
-		capture = cv2.VideoCapture(0)
-	capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG')) # type: ignore[attr-defined]
-	capture.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
-	capture.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
-	capture.set(cv2.CAP_PROP_FPS, fps)
-	return capture
-
-
-def process_stream_frame(source_face : Face, temp_frame : Frame) -> Frame:
-	for frame_processor_module in get_frame_processors_modules(facefusion.globals.frame_processors):
-		if frame_processor_module.pre_process('stream'):
-			temp_frame = frame_processor_module.process_frame(
-				source_face,
-				None,
-				temp_frame
-			)
-	return temp_frame
-
-
-def open_stream(mode : StreamMode, resolution : str, fps : float) -> subprocess.Popen[bytes]:
-	commands = [ '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-s', resolution, '-r', str(fps), '-i', '-' ]
-	if mode == 'udp':
-		commands.extend([ '-b:v', '2000k', '-f', 'mpegts', 'udp://localhost:27000?pkt_size=1316' ])
-	if mode == 'v4l2':
-		device_name = os.listdir('/sys/devices/virtual/video4linux')[0]
-		commands.extend([ '-f', 'v4l2', '/dev/' + device_name ])
-	return open_ffmpeg(commands)
